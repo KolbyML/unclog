@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/utils/merkletrie"
+	"gopkg.in/yaml.v3"
 )
 
 var versionRE = regexp.MustCompile(`^#+ \[(v\d+\.\d+\.\d+)\]`)
@@ -45,6 +47,11 @@ func (c *RepoConfig) PrURL(pr int) string {
 	return "https://github.com/" + c.Owner + "/" + c.Repo + "/pull/" + strconv.Itoa(pr)
 }
 
+// UnclogConfig represents the structure of the .unclog.yaml file
+type UnclogConfig struct {
+	Sections []string `yaml:"sections"`
+}
+
 type Config struct {
 	RepoPath     string
 	Repository   *git.Repository
@@ -57,6 +64,9 @@ type Config struct {
 	Branch       string
 	ReleaseTime  time.Time
 	OutputPath   string
+	// Sections allows overriding the default changelog sections.
+	// If empty, the default global Sections list is used.
+	Sections []string
 }
 
 func (c *Config) Repo() (*git.Repository, error) {
@@ -82,7 +92,7 @@ type Previous struct {
 	Body    string
 }
 
-// ParsePreviousVersionBody drops the changelog preamble and anything up to the previous release
+// NewPreviousChangelog drops the changelog preamble and anything up to the previous release
 // header containing the semver of the last release. It returns the version and the rest of the body
 // including the previous header. These values can be used together with the hardcoded preamble and
 // the new release changelog to assemble the final combined changelog.
@@ -110,11 +120,11 @@ func NewPreviousChangelog(r io.Reader) (Previous, error) {
 // Each commit's changelog file can have entries in different sections, indicated by
 // the same section headers as the final changelog.
 // Merge all changelog bullet points into their respective sections.
-func mergeEntries(fragments []Fragment, repo *RepoConfig) map[string][]string {
+func mergeEntries(fragments []Fragment, repo *RepoConfig, validSections map[string]bool) map[string][]string {
 	sections := make(map[string][]string)
 	for _, f := range fragments {
 		pr := f.Commit.prLink(repo)
-		csecs := ParseFragment(f.Lines, pr)
+		csecs := ParseFragment(f.Lines, pr, validSections)
 		for k, v := range csecs {
 			sections[k] = append(sections[k], v...)
 		}
@@ -177,7 +187,6 @@ func findFragments(dir string, commits []Commit) ([]Fragment, error) {
 	return filtered, nil
 }
 
-// findDeletedFiles returns a list of filepaths deleted in the given directory.
 func findDeletedFiles(dir string, c Commit) ([]string, error) {
 	p, err := c.Parent()
 	if err != nil {
@@ -209,6 +218,23 @@ func findDeletedFiles(dir string, c Commit) ([]string, error) {
 	return deleted, nil
 }
 
+// LoadConfig attempts to read the .unclog.yaml file from the changelog directory.
+func LoadConfig(repoPath string) (*UnclogConfig, error) {
+	configPath := filepath.Join(repoPath, "changelog", ".unclog.yaml")
+	f, err := os.Open(configPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var cfg UnclogConfig
+	decoder := yaml.NewDecoder(f)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
 func Release(ctx context.Context, cfg *Config) (string, error) {
 	prd, pcl, err := getFile(cfg, cfg.PreviousPath)
 	if err != nil {
@@ -221,6 +247,23 @@ func Release(ctx context.Context, cfg *Config) (string, error) {
 	}
 	cfg.Previous = prev
 
+	if len(cfg.Sections) == 0 {
+		fileCfg, err := LoadConfig(cfg.RepoPath)
+		if err == nil && fileCfg != nil && len(fileCfg.Sections) > 0 {
+			cfg.Sections = fileCfg.Sections
+		}
+	}
+
+	activeSections := cfg.Sections
+	if len(activeSections) == 0 {
+		activeSections = Sections
+	}
+
+	validMap := make(map[string]bool)
+	for _, s := range activeSections {
+		validMap[s] = true
+	}
+
 	commits, err := commitsAfter(cfg)
 	if err != nil {
 		return "", err
@@ -229,14 +272,14 @@ func Release(ctx context.Context, cfg *Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sections := mergeEntries(fragments, &cfg.RepoConfig)
+	sections := mergeEntries(fragments, &cfg.RepoConfig, validMap)
 	if cfg.Cleanup {
 		if err := cleanupFragments(cfg, fragments); err != nil {
 			return "", err
 		}
 	}
 	body := preamble + "\n\n" + header(cfg)
-	for _, s := range Sections {
+	for _, s := range activeSections {
 		bs, ok := sections[s]
 		if !ok || len(bs) == 0 {
 			continue
@@ -264,7 +307,7 @@ func header(cfg *Config) string {
 	)
 }
 
-func parseSection(line string) string {
+func parseSection(line string, validSections map[string]bool) string {
 	sec := sectionRE.FindStringSubmatch(line)
 	if len(sec) == 0 {
 		return ""
@@ -273,7 +316,7 @@ func parseSection(line string) string {
 	if sec[1] == sectionIgnored {
 		return sectionIgnored
 	}
-	if _, ok := sectionNames[sec[1]]; !ok {
+	if _, ok := validSections[sec[1]]; !ok {
 		return ""
 	}
 	return sec[1]
@@ -292,11 +335,11 @@ func parseBullet(line string, pr string) string {
 	return strings.TrimRight(line, " .") + ". " + pr
 }
 
-func ParseFragment(lines []string, pr string) map[string][]string {
+func ParseFragment(lines []string, pr string, validSections map[string]bool) map[string][]string {
 	fragments := make(map[string][]string)
 	var current string
 	for _, line := range lines {
-		section := parseSection(line)
+		section := parseSection(line, validSections)
 		if section != "" {
 			current = section
 			continue
@@ -320,12 +363,12 @@ func init() {
 	}
 }
 
-func ValidSections(sections map[string][]string) error {
+func ValidSections(sections map[string][]string, validSections map[string]bool) error {
 	if len(sections) == 0 {
 		return errors.New("no changelog sections found")
 	}
 	for k := range sections {
-		if _, ok := sectionNames[k]; !ok {
+		if _, ok := validSections[k]; !ok {
 			if k == sectionIgnored {
 				continue
 			}
